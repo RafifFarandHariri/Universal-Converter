@@ -1,5 +1,7 @@
 import sys
 import os
+import shutil
+import subprocess
 import tempfile
 from io import BytesIO
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -8,12 +10,12 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QTableWidget, QTableWidgetItem, QHeaderView, QListWidget, QListWidgetItem,
                             QTextEdit, QAbstractItemView, QSplitter, QRadioButton, QButtonGroup,
                             QSlider, QSpinBox, QStackedWidget, QMenu)
-from PyQt5.QtCore import Qt, QSize, QMimeData, QPoint
-from PyQt5.QtGui import QPixmap, QIcon, QPalette, QColor, QDrag, QFont
+from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtGui import QPixmap, QFont
 
 # Import Pillow dengan error handling
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -21,9 +23,14 @@ except ImportError:
 # Import PyPDF2 untuk manipulasi PDF
 try:
     import PyPDF2
-    from PyPDF2 import PdfMerger, PdfReader, PdfWriter
+    from PyPDF2 import PdfReader, PdfWriter
+    try:
+        from PyPDF2 import PdfMerger
+    except ImportError:
+        PdfMerger = None
     PYPDF2_AVAILABLE = True
 except ImportError:
+    PdfMerger = None
     PYPDF2_AVAILABLE = False
 
 # Import reportlab untuk watermark
@@ -34,12 +41,16 @@ try:
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
-# Import PyMuPDF (fitz) untuk render PDF -> JPG (tidak butuh binary eksternal)
+# Import PyMuPDF untuk render PDF -> JPG (tidak butuh binary eksternal)
 try:
-    import fitz  # PyMuPDF
+    import pymupdf as fitz
     FITZ_AVAILABLE = True
 except ImportError:
-    FITZ_AVAILABLE = False
+    try:
+        import fitz  # compatibility with older PyMuPDF releases
+        FITZ_AVAILABLE = True
+    except ImportError:
+        FITZ_AVAILABLE = False
 
 RED = "#c0392b"
 RED_DARK = "#922b21"
@@ -236,14 +247,89 @@ SUPPORTED_IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp', '.gif
 SUPPORTED_PDF_EXTS = ('.pdf',)
 
 
+def unique_output_path(directory, basename, extension):
+    """Return a non-destructive output path, preserving existing files."""
+    extension = extension if extension.startswith('.') else f".{extension}"
+    base = os.path.splitext(os.path.basename(basename))[0] or "converted"
+    candidate = os.path.join(directory, f"{base}{extension}")
+    counter = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{base}_{counter}{extension}")
+        counter += 1
+    return candidate
+
+
+def ensure_extension(path, extension):
+    """Normalize a user-selected output path to the required extension."""
+    extension = extension if extension.startswith('.') else f".{extension}"
+    return path if path.lower().endswith(extension.lower()) else f"{path}{extension}"
+
+
+def libreoffice_path():
+    """Find LibreOffice/soffice without assuming a platform."""
+    return shutil.which("libreoffice") or shutil.which("soffice")
+
+
+def run_libreoffice_conversion(input_path, output_dir, target_format):
+    """Convert common office/document formats using LibreOffice headlessly."""
+    executable = libreoffice_path()
+    if not executable:
+        raise RuntimeError(
+            "LibreOffice tidak ditemukan. Install LibreOffice untuk konversi "
+            "DOCX, PPTX, XLSX, ODT, dan format dokumen lainnya."
+        )
+    os.makedirs(output_dir, exist_ok=True)
+    command = [
+        executable, "--headless", "--convert-to", target_format,
+        "--outdir", output_dir, input_path,
+    ]
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(detail or "LibreOffice gagal mengonversi file.")
+
+    expected = os.path.join(
+        output_dir,
+        f"{os.path.splitext(os.path.basename(input_path))[0]}.{target_format}",
+    )
+    if not os.path.exists(expected):
+        raise RuntimeError(
+            "Konversi selesai tanpa menghasilkan file output. "
+            f"Detail: {(completed.stdout or completed.stderr).strip()}"
+        )
+    return expected
+
+
+def pillow_resample_filter():
+    """Return a Pillow-compatible high-quality resampling filter."""
+    if not PIL_AVAILABLE:
+        return None
+    resampling = getattr(Image, "Resampling", Image)
+    return getattr(resampling, "LANCZOS", getattr(Image, "LANCZOS", 1))
+
+
+def fit_image_to_page(image, page_size):
+    """Fit an image inside a page without stretching or cropping it."""
+    canvas = Image.new("RGB", page_size, "white")
+    fitted = image.copy()
+    fitted.thumbnail(page_size, pillow_resample_filter())
+    offset = (
+        (page_size[0] - fitted.width) // 2,
+        (page_size[1] - fitted.height) // 2,
+    )
+    canvas.paste(fitted, offset)
+    fitted.close()
+    return canvas
+
+
 class ToolCard(QFrame):
-    """
-    Satu kartu fitur di halaman Beranda (mirip kartu di iLovePDF).
-    Kalau `enabled=True` kartu bisa diklik dan memanggil `on_click`.
-    Kalau `enabled=False` kartu tetap kelihatan tapi ditandai
-    "Segera Hadir" dan klik-nya cuma menampilkan info, bukan error,
-    supaya user tahu fitur itu memang belum diimplementasikan.
-    """
     def __init__(self, icon, title, desc, badge_color, enabled=True, on_click=None):
         super().__init__()
         self.enabled = enabled
@@ -309,28 +395,11 @@ class ToolCard(QFrame):
 
 
 class NoScrollComboBox(QComboBox):
-    """
-    QComboBox secara default menangkap wheel event dan memakainya untuk
-    mengganti index/value saat mouse berada di atasnya. Override
-    wheelEvent supaya event di-ignore() saja, jadi scroll mouse di atas
-    combo box tidak mengubah pilihan tanpa sengaja.
-    """
     def wheelEvent(self, event):
         event.ignore()
 
 
 class ReorderableFileTable(QTableWidget):
-    """
-    QTableWidget's built-in InternalMove drag-and-drop only moves individual
-    cells, not whole rows - for a multi-column table like this one that
-    corrupts the row data (columns end up mismatched / values vanish), which
-    is exactly the bug seen when reordering files. So we don't call
-    super().dropEvent() at all; instead we figure out the source row (the
-    row that was selected when the drag started) and the target row (the
-    row under the mouse on drop), and ask the parent window to reorder its
-    underlying file list directly. The table is then fully rebuilt from
-    that list, so it can never end up in an inconsistent state.
-    """
     def __init__(self, parent_window, is_pdf):
         super().__init__(parent_window)
         self.parent_window = parent_window
@@ -375,27 +444,26 @@ def parse_page_range(range_text, max_pages):
     Parse teks seperti '1-3,5,8-10' jadi list index halaman (0-based, unik,
     terurut). Mengembalikan None kalau format tidak valid.
     """
-    if not range_text.strip():
+    if not range_text or max_pages <= 0 or not range_text.strip():
         return None
     pages = set()
     try:
         for part in range_text.split(','):
             part = part.strip()
             if not part:
-                continue
+                return None
             if '-' in part:
                 start_s, end_s = part.split('-', 1)
                 start, end = int(start_s), int(end_s)
-                if start < 1 or end < start:
+                if start < 1 or end < start or end > max_pages:
                     return None
-                for p in range(start, end + 1):
-                    if 1 <= p <= max_pages:
-                        pages.add(p - 1)
+                pages.update(range(start - 1, end))
             else:
                 p = int(part)
-                if 1 <= p <= max_pages:
-                    pages.add(p - 1)
-    except ValueError:
+                if p < 1 or p > max_pages:
+                    return None
+                pages.add(p - 1)
+    except (TypeError, ValueError):
         return None
     return sorted(pages) if pages else None
 
@@ -441,6 +509,9 @@ class EnhancedImageToPDFConverter(QMainWindow):
         self.split_pdf_path = None
         self.rotate_pdf_path = None
         self.watermark_pdf_path = None
+        self.compress_pdf_path = None
+        self.edit_pdf_path = None
+        self.sign_pdf_path = None
         self.pdf2jpg_paths = []
         self.ico_paths = []
         self.converter_pending_paths = []
@@ -448,21 +519,22 @@ class EnhancedImageToPDFConverter(QMainWindow):
 
         self.setup_ui()
 
+        missing = []
         if not PIL_AVAILABLE:
-            QMessageBox.warning(self, "Warning",
-                "Pillow library is required for image processing. Please install it using: pip install Pillow")
-
+            missing.append("Pillow (image/PDF conversion)")
         if not PYPDF2_AVAILABLE:
-            QMessageBox.warning(self, "Warning",
-                "PyPDF2 library is required for PDF operations. Please install it using: pip install PyPDF2")
-
+            missing.append("PyPDF2 (PDF manipulation)")
         if not REPORTLAB_AVAILABLE:
-            QMessageBox.warning(self, "Warning",
-                "reportlab is required for the Watermark tool. Please install it using: pip install reportlab")
-
+            missing.append("reportlab (watermark)")
         if not FITZ_AVAILABLE:
-            QMessageBox.warning(self, "Warning",
-                "PyMuPDF is required for PDF to JPG. Please install it using: pip install PyMuPDF")
+            missing.append("PyMuPDF (PDF rendering/compression)")
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Dependensi belum lengkap",
+                "Fitur tertentu tidak tersedia karena modul berikut belum terpasang:\n\n"
+                + "\n".join(f"• {item}" for item in missing),
+            )
 
     def setup_ui(self):
         self.setWindowTitle("PDF & Image Toolbox")
@@ -506,6 +578,12 @@ class EnhancedImageToPDFConverter(QMainWindow):
 
         self.watermark_tab = QWidget()
         self.setup_watermark_tab()
+        self.compress_tab = QWidget()
+        self.setup_compress_tab()
+        self.edit_tab = QWidget()
+        self.setup_edit_tab()
+        self.sign_tab = QWidget()
+        self.setup_sign_tab()
         self.tool_stack.addWidget(self.image_tab)
         self.tool_stack.addWidget(self.pdf_tab)
         self.tool_stack.addWidget(self.split_tab)
@@ -513,6 +591,9 @@ class EnhancedImageToPDFConverter(QMainWindow):
         self.tool_stack.addWidget(self.pdf2jpg_tab)
         self.tool_stack.addWidget(self.ico_tab)
         self.tool_stack.addWidget(self.watermark_tab)
+        self.tool_stack.addWidget(self.compress_tab)
+        self.tool_stack.addWidget(self.edit_tab)
+        self.tool_stack.addWidget(self.sign_tab)
 
         tools_page = QWidget()
         tools_page.setStyleSheet(f"background-color: {OFFWHITE};")
@@ -587,20 +668,13 @@ class EnhancedImageToPDFConverter(QMainWindow):
         grid.setSpacing(16)
         grid.setContentsMargins(2, 2, 2, 20)
 
-        # (icon, judul, deskripsi, warna badge, tab_index_kalau_aktif)
-        # tab_index None = fitur belum diimplementasikan -> tampil sebagai
-        # kartu "Segera Hadir" dan klik-nya cuma kasih info, tidak error.
-        # tab_index bisa berupa:
-        #   int    -> buka tab tersebut langsung lewat open_tool()
-        #   "converter" -> buka halaman pemilih format (Converter, gaya CloudConvert)
-        #   None   -> fitur belum diimplementasikan, tampil sebagai "Segera Hadir"
         tools = [
             ("🔀", "Converter", "Ubah file antar format: gambar, PDF, Word, PowerPoint, Excel, dan lainnya - tinggal pilih format asal dan tujuan.", RED, "converter"),
             ("🔗", "Gabungkan PDF", "Gabungkan PDF dengan urutan yang Anda inginkan dengan penggabungan PDF termudah.", RED, 1),
             ("✂️", "Pisahkan PDF", "Pisahkan satu halaman atau semuanya agar mudah dikonversi menjadi file PDF terpisah.", RED, 2),
-            ("🗜️", "Kompres PDF", "Kurangi ukuran file dengan tetap mengoptimalkan kualitas PDF maksimal.", "#27ae60", None),
-            ("✏️", "Edit PDF", "Tambahkan teks, gambar, bentuk, atau anotasi manual ke dokumen PDF.", "#8e44ad", None),
-            ("✍️", "Tanda Tangani PDF", "Tanda tangani oleh Anda sendiri atau minta tanda tangan elektronik.", "#2f6fed", None),
+            ("🗜️", "Kompres PDF", "Kurangi ukuran file dengan tetap mengoptimalkan kualitas PDF maksimal.", "#27ae60", 7),
+            ("✏️", "Edit PDF", "Tambahkan teks dan catatan ke dokumen PDF.", "#8e44ad", 8),
+            ("✍️", "Tanda Tangani PDF", "Tambahkan tanda tangan visual ke dokumen PDF.", "#2f6fed", 9),
             ("💧", "Tanda Air", "Tempelkan gambar atau teks di atas PDF Anda dalam hitungan detik.", "#8e44ad", 6),
             ("🔄", "Putar PDF", "Putar PDF sesuai kebutuhan, bahkan beberapa PDF sekaligus.", "#8e44ad", 3),
         ]
@@ -637,17 +711,33 @@ class EnhancedImageToPDFConverter(QMainWindow):
         ]),
         ("Dokumen", "📄", [
             ("PDF", "PDF - Portable Document Format"),
+            ("DOC", "DOC - Word 97–2003"),
             ("DOCX", "DOCX - Word Document"),
         ]),
         ("Presentasi", "📊", [
+            ("PPT", "PPT - PowerPoint 97–2003"),
             ("PPTX", "PPTX - PowerPoint Presentation"),
         ]),
         ("Spreadsheet", "📈", [
+            ("XLS", "XLS - Excel 97–2003"),
             ("XLSX", "XLSX - Excel Spreadsheet"),
+        ]),
+        ("Dokumen lain", "📝", [
+            ("TXT", "TXT - Plain Text"),
+            ("CSV", "CSV - Comma-Separated Values"),
+            ("HTML", "HTML - Web Document"),
+            ("ODT", "ODT - OpenDocument Text"),
+            ("ODS", "ODS - OpenDocument Spreadsheet"),
+            ("ODP", "ODP - OpenDocument Presentation"),
+            ("RTF", "RTF - Rich Text Format"),
         ]),
     ]
 
     CONVERTER_IMAGE_FORMATS = {"JPG", "PNG", "BMP", "GIF", "WEBP", "TIFF", "ICO"}
+    CONVERTER_DOCUMENT_FORMATS = {
+        "PDF", "DOC", "DOCX", "PPT", "PPTX", "XLS", "XLSX", "TXT", "CSV",
+        "HTML", "ODT", "ODS", "ODP", "RTF"
+    }
 
     CONVERTER_ROUTES = {
         ("IMG", "PDF"): 0,
@@ -664,9 +754,20 @@ class EnhancedImageToPDFConverter(QMainWindow):
         "TIF": "TIFF", "TIFF": "TIFF",
         "ICO": "ICO",
         "PDF": "PDF",
+        "DOC": "DOC",
         "DOCX": "DOCX",
+        "PPT": "PPT",
         "PPTX": "PPTX",
+        "XLS": "XLS",
         "XLSX": "XLSX",
+        "TXT": "TXT",
+        "CSV": "CSV",
+        "HTML": "HTML",
+        "HTM": "HTML",
+        "ODT": "ODT",
+        "ODS": "ODS",
+        "ODP": "ODP",
+        "RTF": "RTF",
     }
 
     def _converter_can_handle(self, from_fmt, to_fmt):
@@ -679,6 +780,11 @@ class EnhancedImageToPDFConverter(QMainWindow):
         if from_fmt in img and to_fmt == "PDF":
             return True
         if from_fmt == "PDF" and to_fmt in img:
+            return True
+        if (
+            from_fmt in self.CONVERTER_DOCUMENT_FORMATS
+            and to_fmt in self.CONVERTER_DOCUMENT_FORMATS
+        ):
             return True
         return False
 
@@ -785,8 +891,8 @@ class EnhancedImageToPDFConverter(QMainWindow):
 
         self.converter_status_label = QLabel(
             "📥 Drag & drop file ke halaman ini, atau pilih format secara manual.\n"
-            "✅ Didukung saat ini: Gambar → PDF, PDF → JPG, Gambar → ICO.\n"
-            "📌 Format lain (Word, PowerPoint, Excel, dll) akan segera hadir."
+            "✅ Didukung: konversi gambar, PDF, dan dokumen umum.\n"
+            "📌 DOCX/PPTX/XLSX dan format OpenDocument membutuhkan LibreOffice."
         )
         self.converter_status_label.setStyleSheet(STATUS_LABEL_STYLE)
         self.converter_status_label.setAlignment(Qt.AlignCenter)
@@ -867,15 +973,21 @@ class EnhancedImageToPDFConverter(QMainWindow):
         self.btn_converter_from.setText(self._format_label(self.converter_from_fmt) or "➕  Pilih format asal\n▾ klik untuk memilih")
         self.btn_converter_to.setText(self._format_label(self.converter_to_fmt) or "➕  Pilih format tujuan\n▾ klik untuk memilih")
 
-        ready = bool(self.converter_from_fmt) and bool(self.converter_to_fmt) and \
-            self.converter_from_fmt != self.converter_to_fmt
+        ready = self._converter_can_handle(
+            self.converter_from_fmt, self.converter_to_fmt
+        )
         self.btn_start_convert.setEnabled(ready)
 
     def _resolve_converter_route(self):
         from_fmt = self.converter_from_fmt
         to_fmt = self.converter_to_fmt
         from_key = "IMG" if from_fmt in self.CONVERTER_IMAGE_FORMATS else from_fmt
-        return self.CONVERTER_ROUTES.get((from_key, to_fmt))
+        route = self.CONVERTER_ROUTES.get((from_key, to_fmt))
+        if route is not None:
+            return route
+        if self._converter_can_handle(from_fmt, to_fmt):
+            return "office"
+        return None
 
     def handle_converter_drop(self, paths):
         """Menerima file drag-and-drop dan menyimpannya sebagai input Converter."""
@@ -978,14 +1090,24 @@ class EnhancedImageToPDFConverter(QMainWindow):
         for path in paths:
             try:
                 with Image.open(path) as source:
-                    image = source.convert("RGB") if to_fmt in {"JPG", "BMP"} else source.convert("RGBA") if to_fmt == "ICO" else source.copy()
-                    base = os.path.splitext(os.path.basename(path))[0]
-                    out_path = os.path.join(out_dir, base + ext_map[to_fmt])
-                    n = 1
-                    while os.path.exists(out_path):
-                        out_path = os.path.join(out_dir, f"{base}_{n}{ext_map[to_fmt]}"); n += 1
+                    source = ImageOps.exif_transpose(source)
+                    if to_fmt in {"JPG", "BMP"}:
+                        image = source.convert("RGB")
+                    elif to_fmt == "ICO":
+                        image = source.convert("RGBA")
+                    elif to_fmt == "GIF" and source.mode not in {"P", "L", "1"}:
+                        palette = getattr(
+                            getattr(Image, "Palette", Image), "ADAPTIVE",
+                            getattr(Image, "ADAPTIVE", 1),
+                        )
+                        image = source.convert("P", palette=palette)
+                    else:
+                        image = source.copy()
+                    out_path = unique_output_path(
+                        out_dir, os.path.basename(path), ext_map[to_fmt]
+                    )
                     if to_fmt == "ICO":
-                        image.thumbnail((256, 256), Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.Resampling.LANCZOS)
+                        image.thumbnail((256, 256), pillow_resample_filter())
                         image.save(out_path, format="ICO", sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
                     elif to_fmt == "WEBP":
                         image.save(out_path, format="WEBP", quality=95, method=6)
@@ -1005,6 +1127,44 @@ class EnhancedImageToPDFConverter(QMainWindow):
         else:
             QMessageBox.critical(self, "Konversi Gagal", "Tidak ada file yang berhasil dikonversi.\n\n" + "\n".join(errors))
 
+    def _convert_documents_directly(self):
+        """Konversi dokumen umum melalui LibreOffice headless."""
+        paths = getattr(self, "converter_pending_paths", [])
+        from_fmt = self.converter_from_fmt
+        to_fmt = self.converter_to_fmt
+        if not paths:
+            QMessageBox.warning(self, "Input Tidak Ada", "Silakan drag & drop file terlebih dahulu.")
+            return
+
+        out_dir = QFileDialog.getExistingDirectory(self, "Pilih Folder Output")
+        if not out_dir:
+            return
+
+        converted, errors = 0, []
+        target_ext = to_fmt.lower()
+        for path in paths:
+            try:
+                with tempfile.TemporaryDirectory(prefix="uconv-") as temp_dir:
+                    generated = run_libreoffice_conversion(path, temp_dir, target_ext)
+                    output_path = unique_output_path(out_dir, os.path.basename(generated), target_ext)
+                    shutil.move(generated, output_path)
+                converted += 1
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                errors.append(f"{os.path.basename(path)}: {error}")
+
+        if converted:
+            message = f"✅ {converted} file berhasil dikonversi.\n\n{from_fmt} → {to_fmt}\nFolder: {out_dir}"
+            if errors:
+                message += "\n\n❌ Gagal:\n" + "\n".join(errors)
+            QMessageBox.information(self, "Konversi Berhasil", message)
+            self.converter_status_label.setText(f"✅ {converted} file selesai: {from_fmt} → {to_fmt}")
+        else:
+            QMessageBox.critical(
+                self,
+                "Konversi Gagal",
+                "Tidak ada file yang berhasil dikonversi.\n\n" + "\n".join(errors),
+            )
+
     def _start_converter_flow(self):
         if not self.converter_from_fmt or not self.converter_to_fmt:
             return
@@ -1013,6 +1173,12 @@ class EnhancedImageToPDFConverter(QMainWindow):
             return
         if self.converter_from_fmt in self.CONVERTER_IMAGE_FORMATS and self.converter_to_fmt in self.CONVERTER_IMAGE_FORMATS:
             self._convert_images_directly()
+            return
+        if (
+            self.converter_from_fmt in self.CONVERTER_DOCUMENT_FORMATS
+            and self.converter_to_fmt in self.CONVERTER_DOCUMENT_FORMATS
+        ):
+            self._convert_documents_directly()
             return
         tab_index = self._resolve_converter_route()
         if tab_index is None:
@@ -1408,7 +1574,9 @@ class EnhancedImageToPDFConverter(QMainWindow):
                 for i in range(total_pages):
                     writer = PdfWriter()
                     writer.add_page(reader.pages[i])
-                    out_path = os.path.join(out_dir, f"{base_name}_hal_{i + 1}.pdf")
+                    out_path = unique_output_path(
+                        out_dir, f"{base_name}_hal_{i + 1}", ".pdf"
+                    )
                     with open(out_path, "wb") as f:
                         writer.write(f)
                 self.status_label_split.setText(f"✅ {total_pages} file berhasil dibuat di {out_dir}")
@@ -1421,8 +1589,10 @@ class EnhancedImageToPDFConverter(QMainWindow):
                 save_path, _ = QFileDialog.getSaveFileName(self, "Simpan PDF Sebagai", "", "PDF Files (*.pdf)")
                 if not save_path:
                     return
-                if not save_path.lower().endswith('.pdf'):
-                    save_path += '.pdf'
+                save_path = ensure_extension(save_path, ".pdf")
+                if os.path.abspath(save_path) == os.path.abspath(self.split_pdf_path):
+                    QMessageBox.warning(self, "Peringatan", "File output harus berbeda dari file input.")
+                    return
                 writer = PdfWriter()
                 for idx in page_indices:
                     writer.add_page(reader.pages[idx])
@@ -1539,8 +1709,10 @@ class EnhancedImageToPDFConverter(QMainWindow):
             save_path, _ = QFileDialog.getSaveFileName(self, "Simpan PDF Sebagai", "", "PDF Files (*.pdf)")
             if not save_path:
                 return
-            if not save_path.lower().endswith('.pdf'):
-                save_path += '.pdf'
+            save_path = ensure_extension(save_path, ".pdf")
+            if os.path.abspath(save_path) == os.path.abspath(self.rotate_pdf_path):
+                QMessageBox.warning(self, "Peringatan", "File output harus berbeda dari file input.")
+                return
             with open(save_path, "wb") as f:
                 writer.write(f)
 
@@ -1685,7 +1857,7 @@ class EnhancedImageToPDFConverter(QMainWindow):
         scale = min(canvas_size / image.width, canvas_size / image.height)
         target_width = max(1, int(round(image.width * scale)))
         target_height = max(1, int(round(image.height * scale)))
-        resample = Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.ANTIALIAS
+        resample = pillow_resample_filter()
         resized = image.resize((target_width, target_height), resample)
         offset_x = (canvas_size - target_width) // 2
         offset_y = (canvas_size - target_height) // 2
@@ -1734,7 +1906,7 @@ class EnhancedImageToPDFConverter(QMainWindow):
                     ico_base = self._create_ico_canvas(image, largest_size)
 
                     base_name = os.path.splitext(os.path.basename(image_path))[0]
-                    out_path = os.path.join(out_dir, f"{base_name}.ico")
+                    out_path = unique_output_path(out_dir, base_name, ".ico")
                     ico_base.save(out_path, format="ICO", sizes=sizes)
 
                     converted_count += 1
@@ -1778,15 +1950,15 @@ class EnhancedImageToPDFConverter(QMainWindow):
             total_images = 0
             for pdf_path in self.pdf2jpg_paths:
                 base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-                doc = fitz.open(pdf_path)
-                matrix = fitz.Matrix(zoom, zoom)
-                for page_num in range(len(doc)):
-                    page = doc.load_page(page_num)
-                    pix = page.get_pixmap(matrix=matrix)
-                    out_path = os.path.join(out_dir, f"{base_name}_hal_{page_num + 1}.jpg")
-                    pix.save(out_path)
-                    total_images += 1
-                doc.close()
+                with fitz.open(pdf_path) as doc:
+                    matrix = fitz.Matrix(zoom, zoom)
+                    for page_num in range(len(doc)):
+                        page = doc.load_page(page_num)
+                        pix = page.get_pixmap(matrix=matrix, alpha=False)
+                        output_name = f"{base_name}_hal_{page_num + 1}.jpg"
+                        out_path = unique_output_path(out_dir, output_name, ".jpg")
+                        pix.save(out_path)
+                        total_images += 1
 
             self.status_label_pdf2jpg.setText(f"✅ {total_images} gambar disimpan di {out_dir}")
             QMessageBox.information(self, "Berhasil", f"✅ {total_images} halaman berhasil diekspor ke JPG")
@@ -1891,6 +2063,33 @@ class EnhancedImageToPDFConverter(QMainWindow):
                 self.status_label_watermark,
                 f"📄 {os.path.basename(pdf_files[0])} siap diberi tanda air"
             )
+            return True
+
+        if current_tool == 7:
+            pdf_files = self._filter_dropped_files(paths, SUPPORTED_PDF_EXTS)
+            if not pdf_files:
+                return False
+            self._set_single_pdf_target(
+                pdf_files[0],
+                self.compress_pdf_label,
+                'compress_pdf_path',
+                self.status_label_compress,
+                f"📄 {os.path.basename(pdf_files[0])} siap dikompres"
+            )
+            return True
+
+        if current_tool == 8:
+            pdf_files = self._filter_dropped_files(paths, SUPPORTED_PDF_EXTS)
+            if not pdf_files:
+                return False
+            self._set_edit_pdf(pdf_files[0])
+            return True
+
+        if current_tool == 9:
+            pdf_files = self._filter_dropped_files(paths, SUPPORTED_PDF_EXTS)
+            if not pdf_files:
+                return False
+            self._set_sign_pdf(pdf_files[0])
             return True
 
         return False
@@ -2020,8 +2219,10 @@ class EnhancedImageToPDFConverter(QMainWindow):
             save_path, _ = QFileDialog.getSaveFileName(self, "Simpan PDF Sebagai", "", "PDF Files (*.pdf)")
             if not save_path:
                 return
-            if not save_path.lower().endswith('.pdf'):
-                save_path += '.pdf'
+            save_path = ensure_extension(save_path, ".pdf")
+            if os.path.abspath(save_path) == os.path.abspath(self.watermark_pdf_path):
+                QMessageBox.warning(self, "Peringatan", "File output harus berbeda dari file input.")
+                return
             with open(save_path, "wb") as f:
                 writer.write(f)
 
@@ -2029,6 +2230,396 @@ class EnhancedImageToPDFConverter(QMainWindow):
             QMessageBox.information(self, "Berhasil", "✅ Tanda air berhasil diterapkan")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"❌ Terjadi kesalahan: {str(e)}")
+
+    # Tab: Compress PDF
+    def setup_compress_tab(self):
+        layout = QVBoxLayout(self.compress_tab)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        title_label = QLabel("Kompres PDF")
+        title_label.setStyleSheet(TITLE_BANNER_STYLE)
+        layout.addWidget(title_label)
+
+        row = QHBoxLayout()
+        self.btn_select_compress_pdf = QPushButton("📁 Pilih PDF")
+        self.btn_select_compress_pdf.setStyleSheet(RED_BUTTON_STYLE)
+        self.btn_select_compress_pdf.clicked.connect(self.select_compress_pdf)
+        row.addWidget(self.btn_select_compress_pdf)
+
+        self.compress_pdf_label = QLabel("Belum ada PDF dipilih")
+        self.compress_pdf_label.setStyleSheet(STATUS_LABEL_STYLE)
+        row.addWidget(self.compress_pdf_label, 1)
+        layout.addLayout(row)
+
+        options_group = QGroupBox("⚙️ Opsi Kompresi")
+        options_group.setStyleSheet(GROUPBOX_STYLE)
+        options_layout = QVBoxLayout(options_group)
+        options_layout.setSpacing(10)
+        options_layout.addWidget(QLabel("Profil kompresi:"))
+        self.compress_profile = NoScrollComboBox()
+        self.compress_profile.addItems([
+            "Seimbang (disarankan)",
+            "Ukuran minimum",
+            "Kualitas maksimum",
+        ])
+        self.compress_profile.setStyleSheet(INPUT_STYLE)
+        options_layout.addWidget(self.compress_profile)
+        hint = QLabel(
+            "Kompresi membersihkan objek PDF yang tidak terpakai dan "
+            "mengompres stream. Teks tetap tajam; gambar dapat berubah sesuai profil."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        options_layout.addWidget(hint)
+        layout.addWidget(options_group)
+
+        self.btn_do_compress = QPushButton("🗜️ Kompres & Simpan Sebagai")
+        self.btn_do_compress.setStyleSheet(ACTION_BUTTON_STYLE)
+        self.btn_do_compress.clicked.connect(self.compress_pdf_action)
+        layout.addWidget(self.btn_do_compress)
+
+        self.status_label_compress = QLabel("Pilih PDF untuk mulai")
+        self.status_label_compress.setStyleSheet(STATUS_LABEL_STYLE)
+        self.status_label_compress.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label_compress)
+        layout.addStretch()
+
+    def select_compress_pdf(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Pilih PDF", "", "PDF Files (*.pdf);;All Files (*)"
+        )
+        if file_path:
+            self.compress_pdf_path = file_path
+            self.compress_pdf_label.setText(os.path.basename(file_path))
+            self.status_label_compress.setText(
+                f"📄 {os.path.basename(file_path)} siap dikompres"
+            )
+
+    def compress_pdf_action(self):
+        if not FITZ_AVAILABLE:
+            QMessageBox.critical(
+                self, "Error",
+                "PyMuPDF tidak tersedia. Install dulu: pip install PyMuPDF",
+            )
+            return
+        if not self.compress_pdf_path:
+            QMessageBox.warning(self, "Peringatan", "Pilih file PDF terlebih dahulu")
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Simpan PDF Terkompresi", "", "PDF Files (*.pdf)"
+        )
+        if not save_path:
+            return
+        save_path = ensure_extension(save_path, ".pdf")
+        if os.path.abspath(save_path) == os.path.abspath(self.compress_pdf_path):
+            QMessageBox.warning(
+                self, "Peringatan",
+                "File output harus berbeda dari file input agar data asli tetap aman.",
+            )
+            return
+
+        profile = self.compress_profile.currentIndex()
+        temporary_path = None
+        try:
+            before = os.path.getsize(self.compress_pdf_path)
+            document = fitz.open(self.compress_pdf_path)
+            try:
+                with tempfile.NamedTemporaryFile(
+                    suffix=".pdf", prefix="uconv-compressed-", delete=False
+                ) as temporary:
+                    temporary_path = temporary.name
+
+                save_options = {
+                    "garbage": 4,
+                    "clean": True,
+                    "deflate": True,
+                    "deflate_fonts": True,
+                    "deflate_images": True,
+                }
+                # MuPDF can rewrite streams reliably, but aggressive image
+                # resampling is intentionally avoided to prevent quality loss.
+                if profile == 2:
+                    save_options.update({"garbage": 3, "clean": False})
+                document.save(temporary_path, **save_options)
+            finally:
+                document.close()
+
+            os.replace(temporary_path, save_path)
+            temporary_path = None
+            after = os.path.getsize(save_path)
+            change = (1 - after / before) * 100 if before else 0
+            self.status_label_compress.setText(
+                f"✅ Disimpan: {os.path.basename(save_path)} ({after:,} bytes)"
+            )
+            QMessageBox.information(
+                self, "Berhasil",
+                f"✅ PDF berhasil dikompres.\n\n"
+                f"Ukuran awal: {before:,} bytes\n"
+                f"Ukuran akhir: {after:,} bytes\n"
+                f"Perubahan: {change:.1f}%",
+            )
+        except Exception as error:
+            QMessageBox.critical(self, "Error", f"❌ Terjadi kesalahan: {error}")
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
+
+    # Tab: Edit PDF (text and note annotations)
+    def setup_edit_tab(self):
+        layout = QVBoxLayout(self.edit_tab)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        title_label = QLabel("Edit PDF")
+        title_label.setStyleSheet(TITLE_BANNER_STYLE)
+        layout.addWidget(title_label)
+
+        row = QHBoxLayout()
+        self.btn_select_edit_pdf = QPushButton("📁 Pilih PDF")
+        self.btn_select_edit_pdf.setStyleSheet(RED_BUTTON_STYLE)
+        self.btn_select_edit_pdf.clicked.connect(self.select_edit_pdf)
+        row.addWidget(self.btn_select_edit_pdf)
+        self.edit_pdf_label = QLabel("Belum ada PDF dipilih")
+        self.edit_pdf_label.setStyleSheet(STATUS_LABEL_STYLE)
+        row.addWidget(self.edit_pdf_label, 1)
+        layout.addLayout(row)
+
+        options_group = QGroupBox("⚙️ Isi Perubahan")
+        options_group.setStyleSheet(GROUPBOX_STYLE)
+        options_layout = QVBoxLayout(options_group)
+        options_layout.setSpacing(10)
+        options_layout.addWidget(QLabel("Jenis perubahan:"))
+        self.edit_type = NoScrollComboBox()
+        self.edit_type.addItems(["Teks di halaman", "Catatan (annotation)"])
+        self.edit_type.setStyleSheet(INPUT_STYLE)
+        options_layout.addWidget(self.edit_type)
+
+        page_row = QHBoxLayout()
+        page_row.addWidget(QLabel("Halaman:"))
+        self.edit_page = QSpinBox()
+        self.edit_page.setRange(1, 1)
+        self.edit_page.setStyleSheet(INPUT_STYLE)
+        page_row.addWidget(self.edit_page)
+        page_row.addStretch()
+        options_layout.addLayout(page_row)
+
+        options_layout.addWidget(QLabel("Teks:"))
+        self.edit_text = QTextEdit()
+        self.edit_text.setPlaceholderText("Tulis teks atau isi catatan...")
+        self.edit_text.setStyleSheet(INPUT_STYLE)
+        self.edit_text.setMinimumHeight(100)
+        options_layout.addWidget(self.edit_text)
+
+        options_layout.addWidget(QLabel("Posisi:"))
+        self.edit_position = NoScrollComboBox()
+        self.edit_position.addItems([
+            "Tengah", "Kiri atas", "Kanan atas", "Kiri bawah", "Kanan bawah"
+        ])
+        self.edit_position.setStyleSheet(INPUT_STYLE)
+        options_layout.addWidget(self.edit_position)
+        layout.addWidget(options_group)
+
+        self.btn_do_edit = QPushButton("✏️ Terapkan & Simpan Sebagai")
+        self.btn_do_edit.setStyleSheet(ACTION_BUTTON_STYLE)
+        self.btn_do_edit.clicked.connect(self.edit_pdf_action)
+        layout.addWidget(self.btn_do_edit)
+        self.status_label_edit = QLabel("Pilih PDF untuk mulai")
+        self.status_label_edit.setStyleSheet(STATUS_LABEL_STYLE)
+        self.status_label_edit.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label_edit)
+        layout.addStretch()
+
+    def select_edit_pdf(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Pilih PDF", "", "PDF Files (*.pdf);;All Files (*)"
+        )
+        if file_path:
+            self._set_edit_pdf(file_path)
+
+    def _set_edit_pdf(self, file_path):
+        self.edit_pdf_path = file_path
+        self.edit_pdf_label.setText(os.path.basename(file_path))
+        if FITZ_AVAILABLE:
+            try:
+                with fitz.open(file_path) as document:
+                    self.edit_page.setRange(1, max(1, len(document)))
+            except Exception:
+                pass
+        self.status_label_edit.setText(f"📄 {os.path.basename(file_path)} siap diedit")
+
+    def _position_rect(self, page, width=280, height=70):
+        """Return a safe text rectangle with a small page margin."""
+        margin = 36
+        page_width, page_height = float(page.rect.width), float(page.rect.height)
+        width = min(width, max(80, page_width - 2 * margin))
+        height = min(height, max(40, page_height - 2 * margin))
+        position = self.edit_position.currentIndex()
+        x = margin if position in (1, 3) else page_width - margin - width if position in (2, 4) else (page_width - width) / 2
+        y = margin if position in (1, 2) else page_height - margin - height if position in (3, 4) else (page_height - height) / 2
+        return fitz.Rect(x, y, x + width, y + height)
+
+    def edit_pdf_action(self):
+        if not FITZ_AVAILABLE:
+            QMessageBox.critical(self, "Error", "PyMuPDF tidak tersedia. Install dulu: pip install PyMuPDF")
+            return
+        if not self.edit_pdf_path:
+            QMessageBox.warning(self, "Peringatan", "Pilih file PDF terlebih dahulu")
+            return
+        text = self.edit_text.toPlainText().strip()
+        if not text:
+            QMessageBox.warning(self, "Peringatan", "Isi teks atau catatan terlebih dahulu")
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Simpan PDF Hasil Edit", "", "PDF Files (*.pdf)"
+        )
+        if not save_path:
+            return
+        save_path = ensure_extension(save_path, ".pdf")
+        if os.path.abspath(save_path) == os.path.abspath(self.edit_pdf_path):
+            QMessageBox.warning(self, "Peringatan", "File output harus berbeda dari file input.")
+            return
+
+        try:
+            with fitz.open(self.edit_pdf_path) as document:
+                page = document.load_page(self.edit_page.value() - 1)
+                if self.edit_type.currentIndex() == 0:
+                    page.insert_textbox(
+                        self._position_rect(page), text,
+                        fontsize=16, fontname="helv", color=(0.1, 0.1, 0.1),
+                        align=0,
+                    )
+                else:
+                    rect = self._position_rect(page, width=24, height=24)
+                    page.add_text_annot(rect.tl, text, icon="Note")
+                document.save(save_path, garbage=4, deflate=True)
+            self.status_label_edit.setText(f"✅ Disimpan ke {os.path.basename(save_path)}")
+            QMessageBox.information(self, "Berhasil", "✅ Perubahan PDF berhasil disimpan")
+        except Exception as error:
+            QMessageBox.critical(self, "Error", f"❌ Terjadi kesalahan: {error}")
+
+    # Tab: Visual signature
+    def setup_sign_tab(self):
+        layout = QVBoxLayout(self.sign_tab)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        title_label = QLabel("Tanda Tangani PDF")
+        title_label.setStyleSheet(TITLE_BANNER_STYLE)
+        layout.addWidget(title_label)
+
+        row = QHBoxLayout()
+        self.btn_select_sign_pdf = QPushButton("📁 Pilih PDF")
+        self.btn_select_sign_pdf.setStyleSheet(RED_BUTTON_STYLE)
+        self.btn_select_sign_pdf.clicked.connect(self.select_sign_pdf)
+        row.addWidget(self.btn_select_sign_pdf)
+        self.sign_pdf_label = QLabel("Belum ada PDF dipilih")
+        self.sign_pdf_label.setStyleSheet(STATUS_LABEL_STYLE)
+        row.addWidget(self.sign_pdf_label, 1)
+        layout.addLayout(row)
+
+        options_group = QGroupBox("⚙️ Tanda Tangan Visual")
+        options_group.setStyleSheet(GROUPBOX_STYLE)
+        options_layout = QVBoxLayout(options_group)
+        options_layout.setSpacing(10)
+        options_layout.addWidget(QLabel("Nama / teks tanda tangan:"))
+        self.sign_text = QLineEdit()
+        self.sign_text.setPlaceholderText("Contoh: Budi Santoso")
+        self.sign_text.setStyleSheet(INPUT_STYLE)
+        options_layout.addWidget(self.sign_text)
+        page_row = QHBoxLayout()
+        page_row.addWidget(QLabel("Halaman:"))
+        self.sign_page = QSpinBox()
+        self.sign_page.setRange(1, 1)
+        self.sign_page.setStyleSheet(INPUT_STYLE)
+        page_row.addWidget(self.sign_page)
+        page_row.addStretch()
+        options_layout.addLayout(page_row)
+        options_layout.addWidget(QLabel("Posisi:"))
+        self.sign_position = NoScrollComboBox()
+        self.sign_position.addItems(["Kiri bawah", "Kanan bawah", "Kiri atas", "Kanan atas"])
+        self.sign_position.setStyleSheet(INPUT_STYLE)
+        options_layout.addWidget(self.sign_position)
+        layout.addWidget(options_group)
+
+        note = QLabel(
+            "Catatan: fitur ini menambahkan tanda tangan visual ke PDF, "
+            "bukan tanda tangan digital bersertifikat/kriptografis."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        layout.addWidget(note)
+        self.btn_do_sign = QPushButton("✍️ Terapkan & Simpan Sebagai")
+        self.btn_do_sign.setStyleSheet(ACTION_BUTTON_STYLE)
+        self.btn_do_sign.clicked.connect(self.sign_pdf_action)
+        layout.addWidget(self.btn_do_sign)
+        self.status_label_sign = QLabel("Pilih PDF untuk mulai")
+        self.status_label_sign.setStyleSheet(STATUS_LABEL_STYLE)
+        self.status_label_sign.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label_sign)
+        layout.addStretch()
+
+    def select_sign_pdf(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Pilih PDF", "", "PDF Files (*.pdf);;All Files (*)"
+        )
+        if file_path:
+            self._set_sign_pdf(file_path)
+
+    def _set_sign_pdf(self, file_path):
+        self.sign_pdf_path = file_path
+        self.sign_pdf_label.setText(os.path.basename(file_path))
+        if FITZ_AVAILABLE:
+            try:
+                with fitz.open(file_path) as document:
+                    self.sign_page.setRange(1, max(1, len(document)))
+            except Exception:
+                pass
+        self.status_label_sign.setText(f"📄 {os.path.basename(file_path)} siap ditandatangani")
+
+    def sign_pdf_action(self):
+        if not FITZ_AVAILABLE:
+            QMessageBox.critical(self, "Error", "PyMuPDF tidak tersedia. Install dulu: pip install PyMuPDF")
+            return
+        if not self.sign_pdf_path:
+            QMessageBox.warning(self, "Peringatan", "Pilih file PDF terlebih dahulu")
+            return
+        signature = self.sign_text.text().strip()
+        if not signature:
+            QMessageBox.warning(self, "Peringatan", "Isi teks tanda tangan terlebih dahulu")
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Simpan PDF Bertanda Tangan", "", "PDF Files (*.pdf)"
+        )
+        if not save_path:
+            return
+        save_path = ensure_extension(save_path, ".pdf")
+        if os.path.abspath(save_path) == os.path.abspath(self.sign_pdf_path):
+            QMessageBox.warning(self, "Peringatan", "File output harus berbeda dari file input.")
+            return
+
+        try:
+            with fitz.open(self.sign_pdf_path) as document:
+                page = document.load_page(self.sign_page.value() - 1)
+                margin = 36
+                position = self.sign_position.currentIndex()
+                y_top = margin if position in (2, 3) else page.rect.height - 48
+                x = margin if position in (0, 2) else max(margin, page.rect.width - 220)
+                page.insert_text(
+                    (x, y_top), signature, fontsize=24, fontname="heit",
+                    color=(0.05, 0.05, 0.2),
+                )
+                document.save(save_path, garbage=4, deflate=True)
+            self.status_label_sign.setText(f"✅ Disimpan ke {os.path.basename(save_path)}")
+            QMessageBox.information(self, "Berhasil", "✅ Tanda tangan visual berhasil ditambahkan")
+        except Exception as error:
+            QMessageBox.critical(self, "Error", f"❌ Terjadi kesalahan: {error}")
 
     # Shared file-list logic (Image tab & Merge PDF tab)
     def add_files_from_paths(self, paths_with_types):
@@ -2322,11 +2913,12 @@ class EnhancedImageToPDFConverter(QMainWindow):
                 info_text = self.get_file_info(file_path, False)
                 info_label.setText(info_text)
                 if PIL_AVAILABLE:
-                    img = Image.open(file_path)
-                    img = img.convert('RGBA') if img.mode != 'RGBA' else img
-                    img.thumbnail((360, 240), Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS)
-                    image_label.setText("")
-                    image_label.setPixmap(pil_image_to_pixmap(img, (360, 240)))
+                    with Image.open(file_path) as source:
+                        img = source.convert('RGBA')
+                        img.thumbnail((360, 240), pillow_resample_filter())
+                        image_label.setText("")
+                        image_label.setPixmap(pil_image_to_pixmap(img, (360, 240)))
+                        img.close()
                 else:
                     image_label.setPixmap(QPixmap())
                     image_label.setText("Preview tidak tersedia")
@@ -2367,25 +2959,22 @@ class EnhancedImageToPDFConverter(QMainWindow):
                 orientation = self.orientation.currentText()
 
                 for img_path in image_files:
-                    img = Image.open(img_path)
-                    if img.mode != 'RGB':
-                        img = img.convert('RGB')
-
-                    if page_size == "Original":
-                        images.append(img)
-                    else:
-                        sizes = {
-                            "A4": (2480, 3508),
-                            "Letter": (2550, 3300),
-                            "Legal": (2550, 4200),
-                            "A3": (3508, 4961),
-                            "A5": (1748, 2480)
-                        }
-                        size = sizes.get(page_size, img.size)
-                        if orientation == "Landscape":
-                            size = (size[1], size[0])
-                        img = img.resize(size, Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS)
-                        images.append(img)
+                    with Image.open(img_path) as source:
+                        img = source.convert('RGB')
+                        if page_size == "Original":
+                            images.append(img)
+                        else:
+                            sizes = {
+                                "A4": (2480, 3508),
+                                "Letter": (2550, 3300),
+                                "Legal": (2550, 4200),
+                                "A3": (3508, 4961),
+                                "A5": (1748, 2480)
+                            }
+                            size = sizes.get(page_size, img.size)
+                            if orientation == "Landscape":
+                                size = (size[1], size[0])
+                            images.append(fit_image_to_page(img, size))
 
                 if images:
                     images[0].save(
@@ -2394,11 +2983,18 @@ class EnhancedImageToPDFConverter(QMainWindow):
                         append_images=images[1:],
                         title=self.pdf_title.text(),
                     )
+                    for image in images:
+                        image.close()
 
                     QMessageBox.information(self, "Berhasil", f"✅ PDF berhasil dibuat")
                     self.status_label_images.setText("Konversi selesai ✅")
 
             except Exception as e:
+                for image in locals().get("images", []):
+                    try:
+                        image.close()
+                    except Exception:
+                        pass
                 QMessageBox.critical(self, "Error", f"❌ Terjadi kesalahan: {str(e)}")
 
     def merge_pdfs(self):
@@ -2421,16 +3017,32 @@ class EnhancedImageToPDFConverter(QMainWindow):
 
         if file_path:
             try:
-                if not file_path.lower().endswith('.pdf'):
-                    file_path += '.pdf'
+                file_path = ensure_extension(file_path, ".pdf")
+                if any(os.path.abspath(file_path) == os.path.abspath(pdf) for pdf in pdf_files):
+                    QMessageBox.warning(
+                        self, "Peringatan",
+                        "File output harus berbeda dari file input.",
+                    )
+                    return
 
-                merger = PdfMerger()
-
-                for pdf_path in pdf_files:
-                    merger.append(pdf_path)
-
-                merger.write(file_path)
-                merger.close()
+                if PdfMerger is not None:
+                    merger = PdfMerger()
+                    try:
+                        for pdf_path in pdf_files:
+                            merger.append(pdf_path)
+                        merger.write(file_path)
+                    finally:
+                        merger.close()
+                else:
+                    # PdfMerger was removed in newer pypdf/PyPDF2 releases.
+                    writer = PdfWriter()
+                    for pdf_path in pdf_files:
+                        with open(pdf_path, "rb") as source:
+                            reader = PdfReader(source)
+                            for page in reader.pages:
+                                writer.add_page(page)
+                    with open(file_path, "wb") as output:
+                        writer.write(output)
 
                 QMessageBox.information(self, "Berhasil", f"✅ PDF berhasil digabungkan")
                 self.status_label_pdfs.setText("Penggabungan selesai ✅")
